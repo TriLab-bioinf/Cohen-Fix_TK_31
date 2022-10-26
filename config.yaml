@@ -1,0 +1,19 @@
+# Metadata
+reference:  
+    abundant_rna_file: data/00ref/
+    adapter: data/00adapters/truseq.fa.gz
+    ensembl_ver: 106
+    ensembl_gtf: data/00ref/Saccharomyces_cerevisiae.R64-1-1.106.gtf 
+    genome_build: R64-1-1.106
+    genome_file: data/00ref/Saccharomyces_cerevisiae.R64-1-1.106.fa
+    star_index: 00ref
+    genome_source: ensembl
+remove_duplicated_reads: True
+remove_abundant_rnas: False      
+star_db:
+    sjdbOverhang: 74
+samples:
+    OC7826-1:
+    OC7826-1:
+    OC7826-2:
+    OC7826-2:
