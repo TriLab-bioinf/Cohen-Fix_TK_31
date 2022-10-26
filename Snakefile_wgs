@@ -1,0 +1,214 @@
+# vim: set ft=python:
+
+# WGS-Bowtie mapping workflow v1.0 for paired-end reads
+# Hernan Lorenzi
+# hernan.lorenzi@nih.gov
+# Workflow does not require to have a bowtie2 index already available within the data/00ref directory
+# Also, it is necessary to configure the config.yaml file accordingly to include all metadatata required.
+
+import os
+import glob
+from os.path import exists
+
+configfile: "config/config.yaml"
+samples = config["samples"].keys()
+genome = config["reference"]["genome_file"]
+adapter = config["reference"]["adapter"]
+my_suffix_raw = ['R1','R2']
+my_suffix_trim = ['1P','2P','U']
+
+
+# Flag for avoiding removing duplicated reads
+if config["remove_duplicated_reads"] == True:
+    rm_dup_flag = "true"
+else:
+    rm_dup_flag = "false"
+
+# Functions
+def get_fq1(wildcards):
+            return [ my_files for my_files in glob.glob(f"data/00reads/{wildcards.sample}_*_R1*.fastq.gz")]
+
+def get_fq2(wildcards):
+            b = [ my_files for my_files in glob.glob(f"data/00reads/{wildcards.sample}_*_R1*.fastq.gz")]
+            c = list(map(lambda x: str.replace(x, "_R1", "_R2"), b))
+            return c
+
+
+# Set what rules to run locally
+localrules: all  # ,
+# build_abundant_db
+
+rule all:
+    # IMPORTANT: output file fo all rule has to match the name specified in the output file
+    # and not include suffixes that the command use might add to it.
+    input:  #o0 = "results/05counts/read_counts.summary",
+            #o1 = expand("results/06fastqc_raw/{s}_fastqc.html", s=samples),
+            #o3 = expand("results/06fastqc_trim/{s}.trimmed_fastqc.html", s=samples),
+            o7 = "results/07multiqc/multiqc_done.flag",
+            o9 = expand("results/05bigwig/{s}.bw", s=samples)
+
+rule merge_rep:
+    input: fq1 = get_fq1,
+           fq2 = get_fq2
+    output: merge1 = temp("results/00merged_reads/{sample}.R1.fastq.gz"),
+            merge2 = temp("results/00merged_reads/{sample}.R2.fastq.gz")
+    resources:
+        cpu_per_task = 1,
+        partition = "quick",
+        time = "3:00:00"
+    shell:
+        """
+        cat {input.fq1}  > {output.merge1}
+        cat {input.fq2}  > {output.merge2}
+       """
+
+rule trimming:
+    input:  fq1 = "results/00merged_reads/{sample}.R1.fastq.gz",
+            fq2 = "results/00merged_reads/{sample}.R2.fastq.gz"
+    output: fq1P = "results/01trim/{sample}.1P.fastq.gz",
+            fq2P = "results/01trim/{sample}.2P.fastq.gz",
+            fqU = "results/01trim/{sample}.U.fastq.gz"
+    params:
+        "ktrim=r k=23 mink=11 hdist=1 tpe tbo qtrim=rl trimq=20 overwrite=t"
+    resources:
+        cpus_per_task = 16,
+        partition = "quick",
+        time = "4:00:00"
+    threads: 16
+    log:log1 = "results/01trim/{sample}.log",
+        log2 = "results/01trim/{sample}.stats.log"
+    benchmark:
+        "benchmarks/trim/{sample}.tsv"
+    shell:
+        """
+        bbduk.sh -Xmx1g threads={threads} \
+            in1={input.fq1} in2={input.fq2} \
+            out1={output.fq1P} out2={output.fq2P} outs={output.fqU} \
+            ref=data/00adapters/truseq.fa.gz \
+            {params} stats={log.log2} 2> {log.log1}
+        """
+
+if exists("data/00ref/gnome_reference.rev.2.bt2") == False:
+    rule build_bowtie_db:
+        input: f"{genome}"
+        output: "data/00ref/gnome_reference"
+        shell:
+            """
+            bowtie2-build {input} {output}
+            touch {output}
+            """
+
+rule map_reads:
+    input:  fq1P = "results/01trim/{sample}.1P.fastq.gz",
+            fq2P = "results/01trim/{sample}.2P.fastq.gz",
+            genome_idx = "data/00ref/gnome_reference",
+            genome = f"{genome}"
+    output:
+        bam = "results/03map_reads/{sample}.bam",
+        metrics = "results/03map_reads/{sample}.metrics.txt",
+        sorted_bam = "results/03map_reads/{sample}.sorted.bam"
+    threads: 16
+    resources:
+        cpus_per_task = 16,
+        partition = "norm",
+        time = "24:00:00",
+        gres = "lscratch:20"
+    log:
+        logs = "results/03map_reads/{sample}.log"
+    benchmark:
+        "benchmarks/03map_reads/{sample}.tsv"
+    shell:
+        """
+        bowtie2 --threads {threads} -L 20 -x {input.genome_idx} \
+            --met-file {output.metrics} \
+            --end-to-end \
+            -1 {input.fq1P} -2 {input.fq2P} 2> {log.logs} 1> {output.bam}
+        samtools sort  --threads {threads} --write-index -T results/03map_reads/{wildcards.sample}/ -O BAM  --reference {input.genome} -o {output.sorted_bam} {output.bam} 
+        """
+
+rule remove_duplicates:
+    input: "results/03map_reads/{sample}.sorted.bam"
+    output: "results/04dedup/{sample}.sorted.dedup.bam"
+    params: f"READ_NAME_REGEX=null REMOVE_DUPLICATES={rm_dup_flag}"
+    log: "results/04dedup/{sample}.sorted.dedup.metrics.txt"
+    benchmark:
+        "benchmarks/remove_duplicates/{sample}.tsv"
+    resources:
+        cpus_per_task = 4,
+        mem_mb = 64000,
+        partition = "quick",
+        time = "4:00:00",
+        gres = "lscratch:20"
+    shell:
+        """
+        picard -Xmx32g MarkDuplicates \
+         I={input} \
+         O={output} \
+         M={log} \
+         {params}
+        samtools index {output}
+        """
+
+rule make_bigwig:
+    input: "results/04dedup/{sample}.sorted.dedup.bam"
+    output: "results/05bigwig/{sample}.bw"
+    # + "--filterRNAstrand [forward/reverse]" to plot strand-specific data
+    params: "--binSize 10 --normalizeUsing BPM"
+    threads: 8
+    resources:
+        cpus_per_task = 8,
+        partition = "norm",
+        time = "14:00:00"
+    shell:
+        """
+        bamCoverage -p {threads} -b {input} -o {output} {params}
+        """
+
+rule fastqc:
+    input: 
+        iraw = expand("results/00merged_reads/{s}.{sf_raw}.fastq.gz", s=samples, sf_raw=my_suffix_raw),
+        itrim = expand("results/01trim/{s}.{sf_trim}.fastq.gz", s=samples, sf_trim=my_suffix_trim)
+    output:
+        zip_raw = expand("results/06fastqc_raw/{s}.{sf_raw}_fastqc.zip", s=samples, sf_raw=my_suffix_raw),
+        zip_trim = expand("results/06fastqc_trim/{s}.{sf_trim}_fastqc.zip",s=samples, sf_trim=my_suffix_trim)
+    threads: 8
+    resources:
+        cpus_per_task = 8,
+        partition = "quick",
+        time = "4:00:00",
+        mem_mb = 4000
+    params:
+        "--quiet"
+    shell:
+        """
+        fastqc {params} -t {threads} -o results/06fastqc_raw {input.iraw}
+        fastqc {params} -t {threads} -o results/06fastqc_trim {input.itrim}
+        touch {output.zip_raw}
+        touch {output.zip_trim}
+        """
+
+rule multiqc:
+    input:
+        i1 = expand("results/01trim/{s}.log", s=samples),
+        i3 = expand(
+            "results/03map_reads/{s}.metrics.txt", s=samples),
+        i4 = expand(
+            "results/04dedup/{s}.sorted.dedup.metrics.txt", s=samples),
+        i7 = expand(
+            "results/06fastqc_raw/{s}.{sf_raw}_fastqc.zip", s=samples, sf_raw=my_suffix_raw),
+        i8 = expand(
+            "results/06fastqc_trim/{s}.{sf_trim}_fastqc.zip", s=samples, sf_trim=my_suffix_trim)
+    output: "results/07multiqc/multiqc_done.flag"
+    resources:
+        partition = "quick",
+        time = "4:00:00",
+        mem_mb = 4000
+    shell:
+        """
+        multiqc -f -d -o results/07multiqc {input.i1} \
+                {input.i3} \
+                {input.i4} \
+                {input.i7} \
+                {input.i8}
+        touch {output}
+        """
